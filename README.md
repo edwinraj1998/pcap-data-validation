@@ -14,6 +14,8 @@ Desktop dashboard for PCAP/PCAPNG validation and protocol analysis using Wiresha
 - CCTV/RTSP/RTP best-effort media extraction
 - Satellite/iDirect PCAPNG custom-block telemetry extraction
 - Raw packet/detail exports
+- Website-style dark dashboard layout with compact sidebar navigation
+- Sortable tables with right-click Copy Cell, Copy Row, and Export Visible Rows
 
 ## Requirements
 
@@ -46,4 +48,3 @@ See `README_OFFLINE_SETUP.md` for full offline installation and dependency instr
 ## Notes
 
 The dashboard relies on Wireshark/TShark dissectors for protocol decoding. Encrypted traffic such as TLS, QUIC, ESP, WireGuard, OpenVPN, and SRTP cannot be decoded into readable content without the required keys.
-

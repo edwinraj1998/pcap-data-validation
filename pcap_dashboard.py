@@ -482,7 +482,109 @@ class PCAPIntelligenceDashboard:
             tree.configure(yscrollcommand=vs.set)
             vs.pack(side=tk.RIGHT, fill=tk.Y)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._attach_tree_context_menu(tree)
         return vs
+
+    def _attach_tree_context_menu(self, tree):
+        """Add copy/export conveniences to analysis tables."""
+        if getattr(tree, "_context_menu_attached", False):
+            return
+        tree._context_menu_attached = True
+        menu = tk.Menu(tree, tearoff=0, bg=self.colors['card_bg'], fg=self.colors['fg'],
+                       activebackground=self.colors['accent'], activeforeground="#ffffff")
+        menu.add_command(label="Copy Cell", command=lambda t=tree: self._copy_tree_cell(t))
+        menu.add_command(label="Copy Row", command=lambda t=tree: self._copy_tree_row(t))
+        menu.add_separator()
+        menu.add_command(label="Export Visible Rows to CSV...",
+                         command=lambda t=tree: self._export_tree_visible_csv(t))
+        tree._context_menu = menu
+        tree._context_iid = ""
+        tree._context_col = ""
+        tree.bind("<Button-3>", lambda e, t=tree: self._show_tree_context_menu(e, t), add="+")
+        tree.bind("<Control-c>", lambda e, t=tree: self._copy_tree_row(t), add="+")
+
+    def _show_tree_context_menu(self, event, tree):
+        """Open a table context menu and remember the clicked cell."""
+        iid = tree.identify_row(event.y)
+        col = tree.identify_column(event.x)
+        tree._context_iid = iid or (tree.selection()[0] if tree.selection() else "")
+        tree._context_col = col
+        if iid:
+            tree.selection_set(iid)
+            tree.focus(iid)
+        try:
+            tree._context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            tree._context_menu.grab_release()
+        return "break"
+
+    def _tree_display_columns(self, tree):
+        """Return visible logical column ids, including the tree column when shown."""
+        cols = []
+        show = str(tree.cget("show") or "")
+        if "tree" in show:
+            cols.append("#0")
+        cols.extend(list(tree.cget("columns") or ()))
+        return cols
+
+    def _tree_heading_text(self, tree, col):
+        """Return the clean heading label for a table column."""
+        if col == "#0":
+            return getattr(tree, "_heading_text", {}).get("#0", "Item")
+        return getattr(tree, "_heading_text", {}).get(col, col)
+
+    def _tree_cell_text(self, tree, iid, col):
+        """Read a cell value from a Treeview."""
+        if not iid:
+            return ""
+        if col == "#0":
+            return str(tree.item(iid, "text") or "")
+        if col.startswith("#"):
+            try:
+                idx = int(col[1:]) - 1
+                logical = list(tree.cget("columns") or ())[idx]
+                return str(tree.set(iid, logical) or "")
+            except Exception:
+                return ""
+        return str(tree.set(iid, col) or "")
+
+    def _copy_to_clipboard(self, text, status_msg="Copied to clipboard"):
+        """Copy text and update status without interrupting the workflow."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.update_status(status_msg)
+
+    def _copy_tree_cell(self, tree):
+        """Copy the right-clicked table cell."""
+        iid = getattr(tree, "_context_iid", "") or (tree.selection()[0] if tree.selection() else "")
+        col = getattr(tree, "_context_col", "") or "#1"
+        text = self._tree_cell_text(tree, iid, col)
+        self._copy_to_clipboard(text, "Copied table cell")
+
+    def _copy_tree_row(self, tree):
+        """Copy the selected table row as tab-separated values."""
+        iid = getattr(tree, "_context_iid", "") or (tree.selection()[0] if tree.selection() else "")
+        if not iid:
+            return
+        cols = self._tree_display_columns(tree)
+        values = [self._tree_cell_text(tree, iid, col) for col in cols]
+        self._copy_to_clipboard("\t".join(values), "Copied table row")
+
+    def _export_tree_visible_csv(self, tree):
+        """Export currently visible top-level table rows to CSV."""
+        path = filedialog.asksaveasfilename(
+            title="Export visible table rows",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        cols = self._tree_display_columns(tree)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([self._tree_heading_text(tree, col) for col in cols])
+            for iid in tree.get_children(""):
+                writer.writerow([self._tree_cell_text(tree, iid, col) for col in cols])
+        self.update_status(f"Exported table rows: {os.path.basename(path)}")
 
     def _available_tshark_fields(self):
         """Return dissector field names supported by the installed TShark."""
@@ -652,6 +754,21 @@ class PCAPIntelligenceDashboard:
 
         content = ttk.Frame(workbench)
         content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.page_header = tk.Frame(content, bg=self.colors['card_bg'], height=42)
+        self.page_header.pack(fill=tk.X, pady=(0, 8))
+        self.page_header.pack_propagate(False)
+        self.current_page_label = tk.Label(
+            self.page_header, text="Overview", anchor="w",
+            bg=self.colors['card_bg'], fg=self.colors['fg'],
+            font=("Segoe UI Semibold", 12, "bold"))
+        self.current_page_label.pack(side=tk.LEFT, fill=tk.Y, padx=(14, 8))
+        self.current_page_hint = tk.Label(
+            self.page_header,
+            text="Right-click any table row to copy cells, copy rows, or export visible rows",
+            anchor="e", bg=self.colors['card_bg'], fg=self.colors['muted'],
+            font=("Segoe UI", 8))
+        self.current_page_hint.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 14))
 
         self.notebook = ttk.Notebook(content, style='Sidebar.TNotebook')
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -909,6 +1026,7 @@ class PCAPIntelligenceDashboard:
             ("Satellite", "Satellite", 14),
             ("Raw", "Raw Data", 15),
         ]
+        self._page_names = {index: label for _, label, index in nav_items if index is not None}
 
         for short_label, label, index in nav_items:
             if index is None:
@@ -997,6 +1115,9 @@ class PCAPIntelligenceDashboard:
             current = self.notebook.index(self.notebook.select())
         except tk.TclError:
             current = 0
+        page_name = getattr(self, "_page_names", {}).get(current)
+        if page_name and hasattr(self, "current_page_label"):
+            self.current_page_label.config(text=page_name)
         for index, btn in getattr(self, "nav_buttons", {}).items():
             selected = index == current
             btn._selected = selected
