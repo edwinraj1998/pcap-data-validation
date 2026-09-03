@@ -1,0 +1,12 @@
+Python official download:
+https://www.python.org/downloads/
+
+Wireshark official download:
+https://www.wireshark.org/download.html
+
+FFmpeg official download:
+https://ffmpeg.org/download.html
+
+FFmpeg Windows builds linked from FFmpeg download page:
+https://www.gyan.dev/ffmpeg/builds/
+

@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+*.pcap
+*.pcapng
+*.done
+exports/
+pcap_exports/
+temp/
+logs/
+wheelhouse/
+.venv/
+venv/
+env/
+

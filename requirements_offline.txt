@@ -1,0 +1,5 @@
+# Optional dashboard modules.
+# Core parsing uses Python standard library plus Wireshark/TShark.
+matplotlib>=3.7.0
+Pillow>=10.0.0
+
