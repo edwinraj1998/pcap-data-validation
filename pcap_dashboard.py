@@ -1799,7 +1799,7 @@ class PCAPIntelligenceDashboard:
         rtp_cols = ("ssrc", "src", "dst", "payload", "callid", "media",
                     "packets", "lost", "maxjitter", "duration")
         rtp_head = ("SSRC", "Source", "Destination", "Codec/PT", "SIP Call-ID",
-                    "Media Security", "Packets", "Lost", "Max Jitter (ms)", "Duration (s)")
+                    "Media Security", "Packets", "Lost", "Max Jitter (ms)", "Wall Time (s)")
         rtp_w = (110, 160, 160, 150, 220, 110, 80, 70, 120, 100)
         self.rtp_tree = ttk.Treeview(rtp_frame, columns=rtp_cols, show="headings", height=7)
         self._setup_tree_columns(
@@ -7455,7 +7455,7 @@ class PCAPIntelligenceDashboard:
         messagebox.showerror("Error", "Could not retrieve selected RTP stream.")
         return None
 
-    def _extract_rtp_to_raw(self, ssrc, src, dst):
+    def _extract_rtp_to_raw(self, ssrc, src, dst, codec=""):
         """
         Extract raw RTP payload bytes for a specific stream using tshark.
         Returns path to a temporary raw audio file, or None on failure.
@@ -7490,10 +7490,12 @@ class PCAPIntelligenceDashboard:
             filter_parts.append(f"udp.dstport == {dst_port}")
         display_filter = " && ".join(filter_parts)
 
-        # Extract RTP payload as hex
+        # Extract RTP payload with ordering/timing fields.
         tshark = self.tshark_path.get()
         cmd = [tshark, "-r", pcap_path, "-Y", display_filter,
-               "-T", "fields", "-e", "rtp.seq", "-e", "rtp.payload",
+               "-T", "fields",
+               "-e", "rtp.seq", "-e", "rtp.timestamp",
+               "-e", "frame.time_epoch", "-e", "rtp.payload",
                "-E", "separator=\t", "-E", "occurrence=f"]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
@@ -7502,30 +7504,67 @@ class PCAPIntelligenceDashboard:
             for line in result.stdout.split("\n"):
                 if not line.strip():
                     continue
-                seq, payload = (line.split("\t", 1) + [""])[:2]
+                seq, rtp_ts, frame_ts, payload = (line.split("\t") + [""] * 4)[:4]
                 if not payload.strip():
                     continue
                 try:
                     seq_value = int(seq)
                 except ValueError:
                     seq_value = len(payload_rows)
-                payload_rows.append((seq_value, payload.strip()))
+                try:
+                    rtp_ts_value = int(rtp_ts)
+                except ValueError:
+                    rtp_ts_value = None
+                try:
+                    frame_ts_value = float(frame_ts)
+                except ValueError:
+                    frame_ts_value = None
+                payload_rows.append({
+                    "seq": seq_value,
+                    "rtp_ts": rtp_ts_value,
+                    "frame_ts": frame_ts_value,
+                    "payload": payload.strip(),
+                })
             if not payload_rows:
                 return None
-            payload_rows.sort(key=lambda item: item[0])
+            payload_rows.sort(key=lambda item: (
+                item["rtp_ts"] if item["rtp_ts"] is not None else 0,
+                item["seq"]))
 
             # Convert hex payloads to raw bytes
             raw_data = b""
             seen = set()
-            for seq_value, hex_payload in payload_rows:
+            prev_rtp_ts = None
+            prev_frame_ts = None
+            prev_payload_len = 0
+            sample_rate = self._rtp_audio_sample_rate(codec)
+            silence_byte = self._rtp_silence_byte(codec)
+            for item in payload_rows:
+                seq_value = item["seq"]
                 if seq_value in seen:
                     continue
                 seen.add(seq_value)
+                hex_payload = item["payload"]
                 hex_clean = hex_payload.replace(":", "")
                 try:
-                    raw_data += bytes.fromhex(hex_clean)
+                    payload_bytes = bytes.fromhex(hex_clean)
                 except ValueError:
                     continue
+                if raw_data and silence_byte is not None and sample_rate:
+                    gap_samples = 0
+                    if item["rtp_ts"] is not None and prev_rtp_ts is not None:
+                        expected_ts = prev_rtp_ts + prev_payload_len
+                        gap_samples = max(0, item["rtp_ts"] - expected_ts)
+                    elif item["frame_ts"] is not None and prev_frame_ts is not None:
+                        expected_gap = prev_payload_len / sample_rate
+                        gap_seconds = max(0.0, (item["frame_ts"] - prev_frame_ts) - expected_gap)
+                        gap_samples = int(gap_seconds * sample_rate)
+                    if gap_samples:
+                        raw_data += bytes([silence_byte]) * min(gap_samples, sample_rate * 300)
+                raw_data += payload_bytes
+                prev_rtp_ts = item["rtp_ts"]
+                prev_frame_ts = item["frame_ts"]
+                prev_payload_len = len(payload_bytes)
 
             if not raw_data:
                 return None
@@ -7537,6 +7576,24 @@ class PCAPIntelligenceDashboard:
             return raw_path
         except Exception:
             return None
+
+    def _rtp_audio_sample_rate(self, codec):
+        """Return RTP audio clock/sample rate for codecs we export as raw bytes."""
+        codec_lower = str(codec or "").lower()
+        if "g722" in codec_lower:
+            return 8000
+        if any(token in codec_lower for token in ("pcmu", "pcma", "g.711", "g711")):
+            return 8000
+        return 0
+
+    def _rtp_silence_byte(self, codec):
+        """Return codec silence byte for sparse G.711 RTP streams."""
+        codec_lower = str(codec or "").lower()
+        if "pcma" in codec_lower or "a-law" in codec_lower or "alaw" in codec_lower:
+            return 0xD5
+        if "pcmu" in codec_lower or "u-law" in codec_lower or "mulaw" in codec_lower:
+            return 0xFF
+        return None
 
     def _rtp_audio_support(self, stream):
         """Return whether this stream can be exported as playable audio."""
@@ -7652,7 +7709,7 @@ class PCAPIntelligenceDashboard:
         self.rtp_status.config(text="Extracting RTP payload...")
         self.root.update()
 
-        raw_path = self._extract_rtp_to_raw(ssrc, src, dst)
+        raw_path = self._extract_rtp_to_raw(ssrc, src, dst, codec)
         if not raw_path:
             self.rtp_status.config(text="")
             messagebox.showerror("Extraction Failed",
@@ -7724,7 +7781,7 @@ class PCAPIntelligenceDashboard:
         self.rtp_status.config(text="Extracting RTP payload...")
         self.root.update()
 
-        raw_path = self._extract_rtp_to_raw(ssrc, src, dst)
+        raw_path = self._extract_rtp_to_raw(ssrc, src, dst, codec)
         if not raw_path:
             self.rtp_status.config(text="")
             messagebox.showerror("Extraction Failed",
