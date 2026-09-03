@@ -1796,17 +1796,19 @@ class PCAPIntelligenceDashboard:
                                    bg=self.colors['bg'], fg=self.colors['muted'])
         self.rtp_status.pack(side=tk.LEFT, padx=10)
 
-        rtp_cols = ("ssrc", "src", "dst", "payload", "packets", "lost",
-                    "maxjitter", "duration")
-        rtp_head = ("SSRC", "Source", "Destination", "Codec/PT", "Packets",
-                    "Lost", "Max Jitter (ms)", "Duration (s)")
-        rtp_w = (110, 160, 160, 130, 80, 70, 120, 100)
+        rtp_cols = ("ssrc", "src", "dst", "payload", "callid", "media",
+                    "packets", "lost", "maxjitter", "duration")
+        rtp_head = ("SSRC", "Source", "Destination", "Codec/PT", "SIP Call-ID",
+                    "Media Security", "Packets", "Lost", "Max Jitter (ms)", "Duration (s)")
+        rtp_w = (110, 160, 160, 150, 220, 110, 80, 70, 120, 100)
         self.rtp_tree = ttk.Treeview(rtp_frame, columns=rtp_cols, show="headings", height=7)
         self._setup_tree_columns(
             self.rtp_tree, rtp_cols, rtp_head, rtp_w,
-            numeric_cols=("packets", "lost", "maxjitter", "duration"))
+            numeric_cols=("packets", "lost", "maxjitter", "duration"),
+            stretch_cols=("callid",))
         self._add_tree_scrollbars(rtp_frame, self.rtp_tree)
         self.rtp_tree.tag_configure("loss", foreground=self.colors['danger'])
+        self.rtp_tree.tag_configure("secure", foreground=self.colors['warning'])
 
     def create_cctv_tab(self):
         """CCTV/RTSP/RTP stream discovery and best-effort video decode tab."""
@@ -5521,29 +5523,73 @@ class PCAPIntelligenceDashboard:
         """Extract SIP messages and aggregate RTP media streams by SSRC."""
         tshark = self.tshark_path.get()
         sip_msgs = []
+        sdp_payloads = defaultdict(list)
+        sdp_ports = defaultdict(list)
         try:
-            cmd_sip = [tshark, "-r", pcap_path, "-Y", "sip", "-T", "fields",
-                       "-e", "frame.number", "-e", "frame.time",
-                       "-e", "ip.src", "-e", "ip.dst",
-                       "-e", "ipv6.src", "-e", "ipv6.dst",
-                       "-e", "sip.Method", "-e", "sip.Status-Code",
-                       "-e", "sip.Status-Line",
-                       "-e", "sip.From", "-e", "sip.To", "-e", "sip.Call-ID",
-                       "-E", "separator=\t", "-E", "occurrence=f"]
+            sip_fields = self._filter_tshark_fields([
+                "frame.number", "frame.time", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst",
+                "udp.srcport", "udp.dstport", "tcp.srcport", "tcp.dstport",
+                "sip.Method", "sip.Status-Code", "sip.Status-Line",
+                "sip.From", "sip.To", "sip.Call-ID",
+                "sdp.connection_info.address", "sdp.media.media", "sdp.media.port",
+                "sdp.media.proto", "sdp.media.format", "sdp.media_attr",
+                "sdp.media_attribute.value", "sdp.fmtp.parameter",
+                "sdp.crypto.crypto_suite", "sdp.crypto.master_key", "sdp.crypto.master_salt",
+            ])
+            cmd_sip = [tshark, "-r", pcap_path, "-Y", "sip", "-T", "fields"]
+            for field in sip_fields:
+                cmd_sip += ["-e", field]
+            cmd_sip += ["-E", "separator=\t", "-E", "occurrence=a", "-E", "aggregator=,"]
             r = subprocess.run(cmd_sip, capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=180)
             for line in r.stdout.split("\n"):
                 if not line.strip():
                     continue
                 p = line.split("\t")
-                p += [""] * (12 - len(p))
-                (fno, ftime, ip4s, ip4d, ip6s, ip6d, method, scode, sline,
-                 sfrom, sto, callid) = p[:12]
+                p += [""] * (len(sip_fields) - len(p))
+                row = dict(zip(sip_fields, p[:len(sip_fields)]))
+                method = row.get("sip.Method", "")
+                scode = row.get("sip.Status-Code", "")
+                sline = row.get("sip.Status-Line", "")
+                callid = row.get("sip.Call-ID", "")
                 verb = method or (f"{scode} {sline}".strip() if (scode or sline) else "")
+                media_proto = row.get("sdp.media.proto", "")
+                media_security = "SRTP" if re.search(r"\bSAVP|SAVPF|SRTP\b", media_proto, re.I) else "RTP"
+                if row.get("sdp.crypto.crypto_suite") or row.get("sdp.crypto.master_key"):
+                    media_security = "SRTP"
+                codec_map = self._parse_sdp_codec_map(
+                    row.get("sdp.media_attr", ""),
+                    row.get("sdp.media_attribute.value", ""),
+                    row.get("sdp.fmtp.parameter", ""),
+                    row.get("sdp.media.format", ""))
+                media_ports = re.findall(r"\d+", row.get("sdp.media.port", ""))
+                media_formats = re.findall(r"\d+", row.get("sdp.media.format", ""))
+                for port in media_ports:
+                    sdp_ports[port].append({
+                        "callid": callid,
+                        "media_ip": row.get("sdp.connection_info.address", ""),
+                        "media_proto": media_proto,
+                        "media_security": media_security,
+                        "codec_map": codec_map,
+                    })
+                for pt in media_formats:
+                    codec = codec_map.get(pt) or self._RTP_PT.get(pt) or self._rtp_static_payload_name(pt)
+                    sdp_payloads[pt].append({
+                        "callid": callid,
+                        "codec": codec,
+                        "media_security": media_security,
+                    })
                 sip_msgs.append({
-                    "frame": fno, "time": ftime,
-                    "src": ip4s or ip6s, "dst": ip4d or ip6d,
-                    "method": verb, "from": sfrom, "to": sto, "callid": callid,
+                    "frame": row.get("frame.number", ""), "time": row.get("frame.time", ""),
+                    "src": row.get("ip.src", "") or row.get("ipv6.src", ""),
+                    "dst": row.get("ip.dst", "") or row.get("ipv6.dst", ""),
+                    "method": verb, "from": row.get("sip.From", ""), "to": row.get("sip.To", ""),
+                    "callid": callid,
+                    "sdp_media_ip": row.get("sdp.connection_info.address", ""),
+                    "sdp_media_port": row.get("sdp.media.port", ""),
+                    "sdp_media_proto": media_proto,
+                    "sdp_payloads": row.get("sdp.media.format", ""),
+                    "media_security": media_security if media_ports else "",
                 })
         except Exception:
             pass
@@ -5572,8 +5618,13 @@ class PCAPIntelligenceDashboard:
                 key = (ssrc, src, dst)
                 st = rtp_streams.get(key)
                 if st is None:
+                    codec, callid, media_security = self._resolve_rtp_from_sdp(
+                        ptype, sport, dport, sdp_ports, sdp_payloads)
                     st = {"ssrc": ssrc, "src": src, "dst": dst,
-                          "payload": self._RTP_PT.get(ptype, ptype),
+                          "payload_type": ptype,
+                          "payload": codec,
+                          "sip_callid": callid,
+                          "media_security": media_security,
                           "packets": 0, "seqs": [], "times": []}
                     rtp_streams[key] = st
                 st["packets"] += 1
@@ -5606,12 +5657,30 @@ class PCAPIntelligenceDashboard:
                 max_jitter = max(abs(d - mean_d) for d in deltas) * 1000.0
             rtp_list.append({
                 "ssrc": st["ssrc"], "src": st["src"], "dst": st["dst"],
-                "payload": st["payload"], "packets": st["packets"],
+                "payload_type": st.get("payload_type", ""),
+                "payload": st["payload"],
+                "sip_callid": st.get("sip_callid", ""),
+                "media_security": st.get("media_security", "RTP"),
+                "packets": st["packets"],
                 "lost": lost, "max_jitter": max_jitter, "duration": duration,
             })
 
         self.analysis_results["sip"] = sip_msgs
         self.analysis_results["rtp"] = rtp_list
+
+    def _resolve_rtp_from_sdp(self, payload_type, src_port, dst_port, sdp_ports, sdp_payloads):
+        """Resolve RTP codec and SIP Call-ID using SDP media ports/payload maps."""
+        payload_type = str(payload_type or "")
+        base_codec = self._RTP_PT.get(payload_type) or self._rtp_static_payload_name(payload_type) or payload_type
+        for port in (dst_port, src_port):
+            for entry in sdp_ports.get(str(port or ""), []):
+                codec = entry.get("codec_map", {}).get(payload_type) or base_codec
+                return codec, entry.get("callid", ""), entry.get("media_security", "RTP")
+        entries = sdp_payloads.get(payload_type, [])
+        if len(entries) == 1:
+            entry = entries[0]
+            return entry.get("codec") or base_codec, entry.get("callid", ""), entry.get("media_security", "RTP")
+        return base_codec, "", "RTP"
 
     # ------------------------------------------------------------------
     # CCTV: RTSP/ONVIF discovery + best-effort H.264 RTP video decode
@@ -6487,13 +6556,19 @@ class PCAPIntelligenceDashboard:
 
         self.rtp_tree.delete(*self.rtp_tree.get_children())
         rtp = self.analysis_results.get("rtp", [])
-        for s in rtp:
-            tag = "loss" if s.get("lost", 0) > 0 else ""
-            self.rtp_tree.insert("", tk.END, values=(
+        for i, s in enumerate(rtp):
+            tags = []
+            if s.get("lost", 0) > 0:
+                tags.append("loss")
+            if s.get("media_security") == "SRTP":
+                tags.append("secure")
+            self.rtp_tree.insert("", tk.END, iid=f"rtp-{i}", values=(
                 s.get("ssrc", ""), s.get("src", ""), s.get("dst", ""),
-                s.get("payload", ""), s.get("packets", 0), s.get("lost", 0),
+                s.get("payload", ""), s.get("sip_callid", ""),
+                s.get("media_security", "RTP"),
+                s.get("packets", 0), s.get("lost", 0),
                 f"{s.get('max_jitter', 0):.1f}", f"{s.get('duration', 0):.2f}"),
-                tags=(tag,) if tag else ())
+                tags=tuple(tags))
         self.voip_summary.config(
             text=f"SIP messages: {len(sip)}   RTP streams: {len(rtp)}")
 
@@ -7370,7 +7445,8 @@ class PCAPIntelligenceDashboard:
             messagebox.showinfo("No Selection", "Please select an RTP stream first.")
             return None
         try:
-            idx = self.rtp_tree.index(sel[0])
+            iid = sel[0]
+            idx = int(str(iid).split("-", 1)[1]) if str(iid).startswith("rtp-") else self.rtp_tree.index(iid)
             rtp_list = self.analysis_results.get("rtp", [])
             if 0 <= idx < len(rtp_list):
                 return rtp_list[idx]
@@ -7417,18 +7493,34 @@ class PCAPIntelligenceDashboard:
         # Extract RTP payload as hex
         tshark = self.tshark_path.get()
         cmd = [tshark, "-r", pcap_path, "-Y", display_filter,
-               "-T", "fields", "-e", "rtp.payload",
-               "-E", "separator=\n"]
+               "-T", "fields", "-e", "rtp.seq", "-e", "rtp.payload",
+               "-E", "separator=\t", "-E", "occurrence=f"]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=120)
-            payloads = [p.strip() for p in result.stdout.split("\n") if p.strip()]
-            if not payloads:
+            payload_rows = []
+            for line in result.stdout.split("\n"):
+                if not line.strip():
+                    continue
+                seq, payload = (line.split("\t", 1) + [""])[:2]
+                if not payload.strip():
+                    continue
+                try:
+                    seq_value = int(seq)
+                except ValueError:
+                    seq_value = len(payload_rows)
+                payload_rows.append((seq_value, payload.strip()))
+            if not payload_rows:
                 return None
+            payload_rows.sort(key=lambda item: item[0])
 
             # Convert hex payloads to raw bytes
             raw_data = b""
-            for hex_payload in payloads:
+            seen = set()
+            for seq_value, hex_payload in payload_rows:
+                if seq_value in seen:
+                    continue
+                seen.add(seq_value)
                 hex_clean = hex_payload.replace(":", "")
                 try:
                     raw_data += bytes.fromhex(hex_clean)
@@ -7445,6 +7537,23 @@ class PCAPIntelligenceDashboard:
             return raw_path
         except Exception:
             return None
+
+    def _rtp_audio_support(self, stream):
+        """Return whether this stream can be exported as playable audio."""
+        codec = str(stream.get("payload", "") or "")
+        media_security = str(stream.get("media_security", "") or "")
+        codec_lower = codec.lower()
+        if media_security == "SRTP":
+            return False, "This stream is SRTP encrypted. Audio/video needs SRTP keys before it can be decoded."
+        if "telephone-event" in codec_lower:
+            return False, "This is DTMF telephone-event signaling, not voice audio."
+        if any(token in codec_lower for token in ("h264", "h265", "hevc", "jpeg", "video")):
+            return False, "This RTP stream is video, not voice audio. Use the CCTV/video workflow."
+        if "dynamic" in codec_lower or codec.strip().isdigit():
+            return False, "The RTP payload type is not mapped to an audio codec by SIP/SDP."
+        if any(token in codec_lower for token in ("pcmu", "pcma", "g.711", "g711", "g722")):
+            return True, ""
+        return False, f"Audio export is not supported for codec: {codec}"
 
     def _raw_to_wav(self, raw_path, codec, wav_path):
         """
@@ -7468,19 +7577,16 @@ class PCAPIntelligenceDashboard:
             bits_per_sample = 8
         elif "g722" in codec_lower or codec == "9":
             sample_rate = 16000
-            audio_format = 1  # PCM (G.722 decodes to PCM)
-            bits_per_sample = 16
-        else:
-            # Default to mu-law assumption
-            sample_rate = 8000
-            audio_format = 7
+            audio_format = None
             bits_per_sample = 8
+        else:
+            return False
 
         # Try ffmpeg first (best codec support)
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             codec_map = {
-                7: "mulaw", 6: "alaw", 1: "s16le"
+                7: "mulaw", 6: "alaw", None: "g722"
             }
             acodec = codec_map.get(audio_format, "mulaw")
             cmd = [ffmpeg, "-y", "-f", acodec, "-ar", str(sample_rate),
@@ -7493,6 +7599,8 @@ class PCAPIntelligenceDashboard:
                 pass
 
         # Fallback: wrap raw data in WAV header (works for G.711)
+        if audio_format not in (6, 7):
+            return False
         try:
             with open(raw_path, "rb") as f:
                 raw_data = f.read()
@@ -7536,6 +7644,10 @@ class PCAPIntelligenceDashboard:
         src = stream.get("src", "")
         dst = stream.get("dst", "")
         codec = stream.get("payload", "")
+        supported, reason = self._rtp_audio_support(stream)
+        if not supported:
+            messagebox.showwarning("RTP Audio Not Decodable", reason)
+            return
 
         self.rtp_status.config(text="Extracting RTP payload...")
         self.root.update()
@@ -7594,6 +7706,10 @@ class PCAPIntelligenceDashboard:
         src = stream.get("src", "")
         dst = stream.get("dst", "")
         codec = stream.get("payload", "")
+        supported, reason = self._rtp_audio_support(stream)
+        if not supported:
+            messagebox.showwarning("RTP Audio Not Decodable", reason)
+            return
 
         # Ask for save location
         default_name = f"rtp_stream_{ssrc}.wav"
